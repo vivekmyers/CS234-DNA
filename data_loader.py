@@ -10,3 +10,4 @@ def get_V2_data():
         else:
             genes_to_tests[gene].append((seq, score))
     return genes_to_tests
+    
