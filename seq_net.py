@@ -3,8 +3,14 @@ import numpy as np
 import random
 from tqdm import tqdm, trange
 
+eps = 0.00001
+
 class SeqNet:
-    def __init__(self, seq_len=20, ktop=5, lr=0.001, gamma=0.8, horizon=10):
+    def __init__(self, seq_len=20, ktop=5, lr=0.0001, gamma=0.8, horizon=20):
+        '''
+        ktop is size of memory buffer, lr is learning rate, and horizon is number of iterations
+        per episode. Gamma and seq_len are self explanatory.
+        '''
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
@@ -67,10 +73,15 @@ class SeqNet:
         })
 
     def improve(self, seqs, r_ktop, actions, rewards):
+        '''
+        Policy gradient update in both actor and critic
+        '''
         returns = [sum((self.gamma ** (i - j)) * rewards[i]
                        for i in range(j, len(rewards)))
                    for j, _ in enumerate(rewards)]
         adv = self.get_advantages(seqs, r_ktop, actions, returns)
+        adv = np.array(adv)
+        adv = (adv - np.mean(adv)) / (np.std(adv) + eps)
         cl, _ = self.sess.run([self.critic_loss, self.train_critic], feed_dict={
             self.actions: actions,
             self.sequences: seqs,
@@ -84,20 +95,20 @@ class SeqNet:
             self.returns: returns,
             self.on_target_labels: r_ktop,
         })
-        #print(cl, al)
 
     def run(self, seqs, rewards):
         return np.squeeze(self.sess.run(self.sample_output_seq, feed_dict={
             self.sequences: np.array([seqs]),
             self.on_target_labels: np.array([rewards]),
         }))
-
+    
     def flat(self, state):
         return np.reshape(state, [state.shape[0] * state.shape[1], 4])
 
     def path(self, samples):
         '''
-        Rolls out a trajectory from current policy in sample space of vectorized (strand, on-target) tuples.
+        Get states, actions, and rewards of trajectory in given sample space. Rewards are scaled down
+        based on L1 distance to valid sequence.
         '''
         samples = samples[:]
         state = random.sample(samples, self.ktop)
@@ -113,7 +124,6 @@ class SeqNet:
                 break
             seqs, rewards = [np.array(i) for i in zip(*state)]
             action = self.run(self.flat(seqs), rewards)
-            #print(vec_dna(action))
             d = lambda x: sum((x[0][i] != action[i]).any() for i, _ in enumerate(x[0]))
             new_seq, reward = min(samples, key=d)
             for i, v in enumerate(samples):
@@ -121,25 +131,29 @@ class SeqNet:
                     del samples[i]
                     break
             visited.append((new_seq, reward))
-            path.append((state, action, reward))
+            path.append((state, action, reward * (1 - d((new_seq, reward)) / self.seq_len)))
             state = sorted(visited, key=lambda x: -x[1])[:self.ktop]
         return zip(*path)
 
     def train(self, samples, iterations):
         '''
-        Trains in sample space for given iterations.
+        Trains on samples (list of one-hot dna strand, on-target rate tuples) and returns avg reward
         '''
+        results = []
         for i in range(iterations):
             states, actions, rewards = self.path(samples)
+            for k, i, j in list(zip(states, actions, rewards)):
+                results.append(j)
             seqs = np.array([[v[0] for v in x] for x in states])
             labels = np.array([[v[1] for v in x] for x in states])
             self.improve(np.reshape(seqs, [seqs.shape[0], 
                                            seqs.shape[1] * seqs.shape[2], 4]), 
                                              labels, actions, rewards)
+        return np.mean(np.array(results))
             
     def evaluate(self, samples, iterations):
         '''
-        Rolls out given number of trajectories in sample space and returns avg reward.
+        Runs on samples and returns avg reward
         '''
         rewards = []
         for i in range(iterations):
@@ -147,8 +161,8 @@ class SeqNet:
             for k, i, j in list(zip(s, a, r)):
                 rewards.append(j)
         return np.mean(np.array(rewards))
-
-
+    
+    
 def dna_vec(s):
     '''
     Convert DNA to one-hot vector.
