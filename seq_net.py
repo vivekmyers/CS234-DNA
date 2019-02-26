@@ -157,7 +157,7 @@ class SeqNet:
         '''
         rewards = []
         for i in range(iterations):
-            s, a, r = net.path(samples)
+            s, a, r = self.path(samples)
             for k, i, j in list(zip(s, a, r)):
                 rewards.append(j)
         return np.mean(np.array(rewards))
