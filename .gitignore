@@ -3,5 +3,5 @@ venv
 __pycache__
 .*.swp
 *tfevents*
-results
+results/*
 .DS_Store
