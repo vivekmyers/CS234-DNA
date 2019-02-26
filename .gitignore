@@ -4,3 +4,4 @@ __pycache__
 .*.swp
 *tfevents*
 results
+.DS_Store
