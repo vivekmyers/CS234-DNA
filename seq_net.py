@@ -113,13 +113,7 @@ class SeqNet:
         Same as path but runs multiple concurrently.
         '''
         samples_set = [samples[:] for _ in range(n)]
-        state_set = [random.sample(samples, self.ktop) for _ in range(n)]
-        for i, state in enumerate(state_set):
-            for x in state:
-                for j, v in enumerate(samples_set[i]):
-                    if (v[0] == x[0]).all():
-                        del samples_set[i][j]
-                        break
+        state_set = [[samples_set[i][random.randrange(len(samples_set[i]))] for _ in range(self.ktop)] for i in range(n)]
         visited_set = [state[:] for state in state_set]
         path_set = [[] for _ in state_set]
         for i in range(self.horizon):
@@ -135,21 +129,20 @@ class SeqNet:
             new_seq_set = []
             reward_set = []
             for k, sample in enumerate(samples_set):
-                d = lambda x: sum((x[0][i] != action_set[k][i]).any() for i, _ in enumerate(x[0]))
-                new_seq, reward = min(sample, key=d)
+                d = lambda x: np.linalg.norm((x[0] - action_set[k]).flatten(), ord=1) // 2
+                idx = min(range(len(sample)), key=lambda x: d(sample[x]))
+                new_seq, reward = sample[idx]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                for i, v in enumerate(sample):
-                    if (v[0] == new_seq).all():
-                        del sample[i]
-                        break
+                sample[idx] = (new_seq, 0)
+
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
             for i, path in enumerate(path_set):
                 path.append((state_set[i], action_set[i], reward_set[i] *\
                              (1 - d((new_seq_set[i], reward_set[i])) / self.seq_len)))
             for i, _ in enumerate(state_set):
-                state_set[i] = sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]
+                state_set[i] = visited_set[i][-self.ktop:]#, key=lambda x: -x[1])[:self.ktop]
         return [zip(*path) for path in path_set]
 
 
@@ -158,30 +151,7 @@ class SeqNet:
         Get states, actions, and rewards of trajectory in given sample space. Rewards are scaled down
         based on L1 distance to valid sequence.
         '''
-        samples = samples[:]
-        state = random.sample(samples, self.ktop)
-        for x in state:
-            for i, v in enumerate(samples):
-                if (v[0] == x[0]).all():
-                    del samples[i]
-                    break
-        visited = state[:]
-        path = []
-        for i in range(self.horizon):
-            if not samples:
-                break
-            seqs, rewards = [np.array(i) for i in zip(*state)]
-            action = self.run(self.flat(seqs), rewards)
-            d = lambda x: sum((x[0][i] != action[i]).any() for i, _ in enumerate(x[0]))
-            new_seq, reward = min(samples, key=d)
-            for i, v in enumerate(samples):
-                if (v[0] == new_seq).all():
-                    del samples[i]
-                    break
-            visited.append((new_seq, reward))
-            path.append((state, action, reward * (1 - d((new_seq, reward)) / self.seq_len)))
-            state = sorted(visited, key=lambda x: -x[1])[:self.ktop]
-        return zip(*path)
+        return self.multi_path(samples, 1)[0]
 
     
     def train(self, samples, batch):
@@ -235,7 +205,7 @@ class SeqNet:
                                              labels, actions, returns)
         return np.mean(np.array(results))
             
-    def evaluate(self, samples, iterations):
+    def evaluate(self, samples, batch):
         '''
         Runs on samples and returns avg reward
         '''
