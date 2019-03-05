@@ -1,4 +1,6 @@
 xlrd
 pandas
 tensorflow-gpu
+scipy
+matplotlib
 tqdm

@@ -6,17 +6,17 @@ from tqdm import tqdm, trange
 eps = 0.00001
 
 class SeqNet:
-    def __init__(self, seq_len=20, ktop=5, lr=0.0001, gamma=0.8, horizon=20):
+    def __init__(self, sess, seq_len=20, ktop=5, lr=0.0001, gamma=0.8, horizon=20):
         '''
         ktop is size of memory buffer, lr is learning rate, and horizon is number of iterations
         per episode. Gamma and seq_len are self explanatory.
         '''
+        self.sess = sess
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
         self.lr = lr
         self.horizon = horizon
-        self.sess = tf.Session()
         self.build_placeholders()
         self.build_network()
         self.make_train_ops()
@@ -72,13 +72,10 @@ class SeqNet:
             self.on_target_labels: list(r_ktops),
         })
 
-    def improve(self, seqs, r_ktop, actions, rewards):
+    def improve(self, seqs, r_ktop, actions, returns):
         '''
         Policy gradient update in both actor and critic
         '''
-        returns = [sum((self.gamma ** (i - j)) * rewards[i]
-                       for i in range(j, len(rewards)))
-                   for j, _ in enumerate(rewards)]
         adv = self.get_advantages(seqs, r_ktop, actions, returns)
         adv = np.array(adv)
         adv = (adv - np.mean(adv)) / (np.std(adv) + eps)
@@ -104,6 +101,57 @@ class SeqNet:
     
     def flat(self, state):
         return np.reshape(state, [state.shape[0] * state.shape[1], 4])
+    
+    def multi_run(self, seqs_list, rewards_list):
+        return self.sess.run(self.sample_output_seq, feed_dict={
+            self.sequences: np.array(seqs_list),
+            self.on_target_labels: np.array(rewards_list),
+        })
+    
+    def multi_path(self, samples, n=100):
+        '''
+        Same as path but runs multiple concurrently.
+        '''
+        samples_set = [samples[:] for _ in range(n)]
+        state_set = [random.sample(samples, self.ktop) for _ in range(n)]
+        for i, state in enumerate(state_set):
+            for x in state:
+                for j, v in enumerate(samples_set[i]):
+                    if (v[0] == x[0]).all():
+                        del samples_set[i][j]
+                        break
+        visited_set = [state[:] for state in state_set]
+        path_set = [[] for _ in state_set]
+        for i in range(self.horizon):
+            if not any(i for i in samples_set):
+                break
+            seqs_set = []
+            rewards_set = []
+            for state in state_set:
+                seqs, rewards = [np.array(i) for i in zip(*state)]
+                seqs_set.append(seqs)
+                rewards_set.append(rewards)
+            action_set = self.multi_run([self.flat(x) for x in seqs_set], rewards_set)
+            new_seq_set = []
+            reward_set = []
+            for k, sample in enumerate(samples_set):
+                d = lambda x: sum((x[0][i] != action_set[k][i]).any() for i, _ in enumerate(x[0]))
+                new_seq, reward = min(sample, key=d)
+                new_seq_set.append(new_seq)
+                reward_set.append(reward)
+                for i, v in enumerate(sample):
+                    if (v[0] == new_seq).all():
+                        del sample[i]
+                        break
+            for i, visited in enumerate(visited_set):
+                visited.append((new_seq_set[i], reward_set[i]))
+            for i, path in enumerate(path_set):
+                path.append((state_set[i], action_set[i], reward_set[i] *\
+                             (1 - d((new_seq_set[i], reward_set[i])) / self.seq_len)))
+            for i, _ in enumerate(state_set):
+                state_set[i] = sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]
+        return [zip(*path) for path in path_set]
+
 
     def path(self, samples):
         '''
@@ -135,9 +183,42 @@ class SeqNet:
             state = sorted(visited, key=lambda x: -x[1])[:self.ktop]
         return zip(*path)
 
-    def train(self, samples, iterations):
+    
+    def train(self, samples, batch):
         '''
-        Trains on samples (list of one-hot dna strand, on-target rate tuples) and returns avg reward
+        Trains on samples (list of one-hot dna strand, on-target rate tuples) and returns avg reward.
+        Generates batch trajectories concurrently.
+        '''
+        results = []
+        seqs_set = []
+        labels_set = []
+        actions_set = []
+        rewards_set = []
+        for path in self.multi_path(samples, batch):
+            states, actions, rewards = path
+            for k, i, j in list(zip(states, actions, rewards)):
+                results.append(j)
+            seqs = np.array([[v[0] for v in x] for x in states])
+            labels = np.array([[v[1] for v in x] for x in states])
+            seqs = np.reshape(seqs, [seqs.shape[0], 
+                                           seqs.shape[1] * seqs.shape[2], 4]);
+            for seq in seqs:
+                seqs_set.append(seq)
+            for label in labels:
+                labels_set.append(label)
+            for action in actions:
+                actions_set.append(action)
+            returns = [sum((self.gamma ** (i - j)) * rewards[i]
+                       for i in range(j, len(rewards)))
+                           for j, _ in enumerate(rewards)]
+            for reward in returns:
+                rewards_set.append(reward)
+        self.improve(seqs_set, labels_set, actions_set, rewards_set)
+        return np.mean(np.array(results))
+    
+    def single_train(self, samples, iterations):
+        '''
+        Like above, but repeatedly trains on single trajectory
         '''
         results = []
         for i in range(iterations):
@@ -146,21 +227,43 @@ class SeqNet:
                 results.append(j)
             seqs = np.array([[v[0] for v in x] for x in states])
             labels = np.array([[v[1] for v in x] for x in states])
+            returns = [sum((self.gamma ** (i - j)) * rewards[i]
+                       for i in range(j, len(rewards)))
+                           for j, _ in enumerate(rewards)]
             self.improve(np.reshape(seqs, [seqs.shape[0], 
                                            seqs.shape[1] * seqs.shape[2], 4]), 
-                                             labels, actions, rewards)
+                                             labels, actions, returns)
         return np.mean(np.array(results))
             
     def evaluate(self, samples, iterations):
         '''
         Runs on samples and returns avg reward
         '''
-        rewards = []
-        for i in range(iterations):
-            s, a, r = self.path(samples)
-            for k, i, j in list(zip(s, a, r)):
-                rewards.append(j)
-        return np.mean(np.array(rewards))
+        results = []
+        seqs_set = []
+        labels_set = []
+        actions_set = []
+        rewards_set = []
+        for path in self.multi_path(samples, batch):
+            states, actions, rewards = path
+            for k, i, j in list(zip(states, actions, rewards)):
+                results.append(j)
+            seqs = np.array([[v[0] for v in x] for x in states])
+            labels = np.array([[v[1] for v in x] for x in states])
+            seqs = np.reshape(seqs, [seqs.shape[0], 
+                                           seqs.shape[1] * seqs.shape[2], 4]);
+            for seq in seqs:
+                seqs_set.append(seq)
+            for label in labels:
+                labels_set.append(label)
+            for action in actions:
+                actions_set.append(action)
+            returns = [sum((self.gamma ** (i - j)) * rewards[i]
+                       for i in range(j, len(rewards)))
+                           for j, _ in enumerate(rewards)]
+            for reward in returns:
+                rewards_set.append(reward)
+        return np.mean(np.array(results))
     
     
 def dna_vec(s):
@@ -172,10 +275,9 @@ def dna_vec(s):
     arr[np.arange(len(s)), mask] = 1
     return arr
 
+
 def vec_dna(v):
     '''
     Convert DNA vector back to string.
     '''
     return ''.join(['ATCG'[np.argmax(i)] for i in v])
-
-
