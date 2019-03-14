@@ -6,7 +6,7 @@ from tqdm import tqdm, trange
 eps = 0.00001
 
 class SeqNet:
-    def __init__(self, sess, seq_len=20, ktop=5, lr=0.0001, gamma=0.8, horizon=20):
+    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20):
         '''
         ktop is size of memory buffer, lr is learning rate, and horizon is number of iterations
         per episode. Gamma and seq_len are self explanatory.
@@ -15,6 +15,7 @@ class SeqNet:
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
+        self.kmem = kmem
         self.lr = lr
         self.horizon = horizon
         self.build_placeholders()
@@ -25,9 +26,9 @@ class SeqNet:
 
     def build_placeholders(self):
         self.actions = tf.placeholder(tf.float32, shape=[None, self.seq_len, 4], name='actions')
-        self.sequences = tf.placeholder(tf.float32, shape=[None, self.seq_len * self.ktop, 4], name='sequences')
+        self.sequences = tf.placeholder(tf.float32, shape=[None, self.seq_len * (self.ktop + self.kmem), 4], name='sequences')
         self.returns = tf.placeholder(tf.float32, shape=[None], name='returns')
-        self.on_target_labels = tf.placeholder(tf.float32, shape=[None, self.ktop], name='on_target_labels')
+        self.on_target_labels = tf.placeholder(tf.float32, shape=[None, (self.ktop + self.kmem)], name='on_target_labels')
         self.static_advantages = tf.placeholder(tf.float32, shape=[None], name='static_advantages')
 
     def build_network(self):
@@ -37,8 +38,9 @@ class SeqNet:
                                       kernel_size=7, activation=tf.nn.relu)
         self.conv3 = tf.layers.conv1d(inputs=self.conv2, filters=80,
                                       kernel_size=1, activation=tf.nn.relu)
-        self.merged = tf.concat([tf.layers.flatten(self.conv3),
-                                 self.on_target_labels], axis=1)
+        self.merged = tf.layers.dense(inputs=tf.concat([tf.layers.flatten(self.conv3),
+                                                         self.on_target_labels], axis=1),
+                                         units=512, activation=tf.nn.relu)
         self.dense1_actor = tf.layers.dense(inputs=self.merged, units=512,
                                             activation=tf.nn.relu)
         self.dense2_actor = tf.layers.dense(inputs=self.dense1_actor, units=self.seq_len * 4)
@@ -113,8 +115,10 @@ class SeqNet:
         Same as path but runs multiple concurrently.
         '''
         samples_set = [samples[:] for _ in range(n)]
-        state_set = [[samples_set[i][random.randrange(len(samples_set[i]))] for _ in range(self.ktop)] for i in range(n)]
+        state_set = [[samples_set[i][random.randrange(len(samples_set[i]))] for _ in range(self.ktop + self.kmem)] for i in range(n)]
         visited_set = [state[:] for state in state_set]
+        for i, _ in enumerate(state_set):
+            state_set[i] = list(sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]) + visited_set[i][-self.kmem:]
         path_set = [[] for _ in state_set]
         for i in range(self.horizon):
             if not any(i for i in samples_set):
@@ -134,7 +138,6 @@ class SeqNet:
                 new_seq, reward = sample[idx]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                sample[idx] = (new_seq, 0)
 
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
@@ -142,7 +145,7 @@ class SeqNet:
                 path.append((state_set[i], action_set[i], reward_set[i] *\
                              (1 - d((new_seq_set[i], reward_set[i])) / self.seq_len)))
             for i, _ in enumerate(state_set):
-                state_set[i] = visited_set[i][-self.ktop:]#, key=lambda x: -x[1])[:self.ktop]
+                state_set[i] = list(sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]) + visited_set[i][-self.kmem:]
         return [zip(*path) for path in path_set]
 
 
@@ -240,7 +243,7 @@ def dna_vec(s):
     '''
     Convert DNA to one-hot vector.
     '''
-    mask = np.array(['ATCG'.index(i) for i in s])
+    mask = np.array(['ATCG'.index(i) for i in s.upper()])
     arr = np.zeros([len(s), 4])
     arr[np.arange(len(s)), mask] = 1
     return arr

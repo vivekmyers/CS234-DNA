@@ -5,4 +5,5 @@ __pycache__
 *tfevents*
 results/*
 .DS_Store
+data/*.txt
 *.pyc

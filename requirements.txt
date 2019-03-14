@@ -4,3 +4,5 @@ tensorflow-gpu
 scipy
 matplotlib
 tqdm
+sklearn
+seaborn
