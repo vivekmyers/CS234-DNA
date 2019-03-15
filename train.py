@@ -31,7 +31,8 @@ times = []
 
 val = pickle.load(open('results/validation.p', 'rb'))
 tran = pickle.load(open('results/training.p', 'rb'))
-times = pickle.load(open('results/times.p', 'rb'))
+tran_times = pickle.load(open('results/tran_times.p', 'rb'))
+val_times = pickle.load(open('results/val_times.p', 'rb'))
 
 # Load weights
 
@@ -40,8 +41,8 @@ saver.restore(net.sess, 'results/model.ckpt')
 
 # Get search time
 
-def get_time_top3():
-    test_data = data[random.choice(testing)]
+def get_time_top3(dataset):
+    test_data = data[random.choice(dataset)]
 
     s, a, r = net.path([(dna_vec(a), b) for a, b in test_data])
     top3 = sorted(test_data, key=lambda x: x[1])[-3:]
@@ -63,7 +64,8 @@ for i in trange(itr):
     tran.append(net.train(samples, 50))
     gene = random.choice(testing)
     samples = [(dna_vec(a), b) for a, b in data[gene]]
-    times.append(get_time_top3())
+    tran_times.append(get_time_top3(training))
+    val_times.append(get_time_top3(testing))
     if i % 2 + 1:
         val.append(net.evaluate(samples, 10))
     else:
@@ -76,7 +78,8 @@ for i in trange(itr):
 
     pickle.dump(val, open('results/validation.p', 'wb'))
     pickle.dump(tran, open('results/training.p', 'wb'))
-    pickle.dump(times, open('results/times.p', 'wb'))
+    pickle.dump(tran_times, open('results/tran_times.p', 'wb'))
+    pickle.dump(val_times, open('results/val_times.p', 'wb'))
 
     # Save weights
 

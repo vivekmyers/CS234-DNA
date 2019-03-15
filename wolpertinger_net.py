@@ -3,19 +3,24 @@ import numpy as np
 import random
 from tqdm import tqdm, trange
 
-eps = 0.00001
 
-class SeqNet:
-    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20):
+class WolpertingerNet:
+    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20, knn=5, eps=0.1, decay=2048, replay=128):
         '''
         ktop is size of memory buffer, lr is learning rate, and horizon is number of iterations
         per episode. Gamma and seq_len are self explanatory.
         '''
         self.sess = sess
+        self.decay = decay
+        self.knn = knn
+        self.replay = replay
+        self.buffer = []
+        self.eps = 1
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
         self.kmem = kmem
+        self.itr = 0
         self.lr = lr
         self.horizon = horizon
         self.build_placeholders()
@@ -28,78 +33,99 @@ class SeqNet:
         self.actions = tf.placeholder(tf.float32, shape=[None, self.seq_len, 4], name='actions')
         self.sequences = tf.placeholder(tf.float32, shape=[None, self.seq_len * (self.ktop + self.kmem), 4], name='sequences')
         self.returns = tf.placeholder(tf.float32, shape=[None], name='returns')
-        self.on_target_labels = tf.placeholder(tf.float32, shape=[None, (self.ktop + self.kmem)], name='on_target_labels')
-        self.static_advantages = tf.placeholder(tf.float32, shape=[None], name='static_advantages')
+        self.on_target_labels = tf.placeholder(tf.float32, shape=[None, (self.ktop + self.kmem)], name='rates')
+        self.q_computed = tf.placeholder(tf.float32, shape=[None], name='q_computed')
 
     def build_network(self):
         self.conv1 = tf.layers.conv1d(inputs=self.sequences, filters=80,
-                                      kernel_size=7, activation=tf.nn.relu)
+                                      kernel_size=7, activation=tf.nn.relu, name='conv1')
         self.conv2 = tf.layers.conv1d(inputs=self.conv1, filters=80,
-                                      kernel_size=7, activation=tf.nn.relu)
+                                      kernel_size=7, activation=tf.nn.relu, name='conv2')
         self.conv3 = tf.layers.conv1d(inputs=self.conv2, filters=80,
-                                      kernel_size=1, activation=tf.nn.relu)
+                                      kernel_size=1, activation=tf.nn.relu, name='conv3')
         self.merged = tf.layers.dense(inputs=tf.concat([tf.layers.flatten(self.conv3),
-                                                         self.on_target_labels], axis=1),
-                                         units=512, activation=tf.nn.relu)
+                                                         self.on_target_labels], axis=1, name='merged'),
+                                              units=512, activation=tf.nn.relu, name='m_dense')
         self.dense1_actor = tf.layers.dense(inputs=self.merged, units=512,
-                                            activation=tf.nn.relu)
-        self.dense2_actor = tf.layers.dense(inputs=self.dense1_actor, units=self.seq_len * 4)
-        self.dense1_critic = tf.layers.dense(inputs=self.merged, units=512,
-                                             activation=tf.nn.relu)
-        self.dense2_critic = tf.layers.dense(self.dense1_critic, units=1)
+                                            activation=tf.nn.relu, name='a_dense1')
+        self.dense2_actor = tf.layers.dense(inputs=self.dense1_actor, units=self.seq_len * 4, name='a_dense2')
+        
+        self.critic_conv1 = tf.layers.conv1d(inputs=self.actions, filters=80,
+                                      kernel_size=7, activation=tf.nn.relu, name='c_conv1')
+        self.critic_conv2 = tf.layers.conv1d(inputs=self.critic_conv1, filters=80,
+                                      kernel_size=7, activation=tf.nn.relu, name='c_conv2')
+        self.critic_conv3 = tf.layers.conv1d(inputs=self.critic_conv2, filters=80,
+                                      kernel_size=1, activation=tf.nn.relu, name='c_conv3')
+        self.dense1_critic = tf.layers.dense(inputs=tf.concat([self.merged, 
+                                               tf.layers.flatten(self.critic_conv3)], axis=1), units=512,
+                                               activation=tf.nn.relu, name='c_dense1')
+        self.dense2_critic = tf.layers.dense(self.dense1_critic, units=1, name='c_dense2')
 
-        self.output_seq = tf.reshape(self.dense2_actor, [-1, self.seq_len, 4])
+        self.output_seq = tf.reshape(self.dense2_actor, [-1, self.seq_len, 4], name='proto_action')
         self.sample_output_seq = tf.reshape(tf.one_hot(
             tf.reshape(
                 tf.multinomial(tf.reshape(self.output_seq, [-1, 4]), 1),
                 shape=[-1, self.seq_len]),
-            depth=4), [-1, self.seq_len, 4])
+            depth=4), [-1, self.seq_len, 4], name = 'sampled_proto')
         self.logprob = tf.reduce_sum(
             -tf.nn.softmax_cross_entropy_with_logits_v2(
-                labels=self.actions, logits=self.output_seq), axis=1)
-        self.baseline = tf.squeeze(self.dense2_critic, axis=1)
-        self.advantage = self.returns - self.baseline
+                labels=self.actions, logits=self.output_seq, name='cross_entropy'), axis=1, name='logprob')
+        self.q_pred = tf.squeeze(self.dense2_critic, axis=1, name='q_pred')
 
     def make_train_ops(self):
-        self.actor_loss = tf.reduce_mean(-self.logprob * self.static_advantages)
-        self.train_actor = tf.train.AdamOptimizer(self.lr).minimize(self.actor_loss)
-        self.critic_loss = tf.reduce_mean(tf.squared_difference(self.returns, self.baseline))
-        self.train_critic = tf.train.AdamOptimizer(self.lr).minimize(self.critic_loss)
+        self.actor_loss = tf.reduce_mean(-self.logprob * self.q_computed, name='actor_loss')
+        self.train_actor = tf.train.AdamOptimizer(self.lr).minimize(self.actor_loss, name='actor_train_op')
+        self.critic_loss = tf.reduce_mean(tf.squared_difference(self.returns, self.q_pred, name='mse'), name='critic_loss')
+        self.train_critic = tf.train.AdamOptimizer(self.lr).minimize(self.critic_loss, name='critic_train_op')
 
-    def get_advantages(self, seqs, r_ktops, actions, returns):
-        return self.sess.run(self.advantage, feed_dict={
-            self.actions: list(actions),
-            self.sequences: list(seqs),
-            self.returns: list(returns),
-            self.on_target_labels: list(r_ktops),
-        })
 
-    def improve(self, seqs, r_ktop, actions, returns):
+    def improve(self, seqs, r_ktop, actions, new_seqs, returns):
         '''
         Policy gradient update in both actor and critic
         '''
-        adv = self.get_advantages(seqs, r_ktop, actions, returns)
-        adv = np.array(adv)
-        adv = (adv - np.mean(adv)) / (np.std(adv) + eps)
-        cl, _ = self.sess.run([self.critic_loss, self.train_critic], feed_dict={
-            self.actions: actions,
+        critic_loss, q_computed, _ = self.sess.run([self.critic_loss, self.q_pred, self.train_critic], feed_dict={
+            self.actions: new_seqs,
             self.sequences: seqs,
             self.returns: returns,
             self.on_target_labels: r_ktop,
         })
-        al, _ = self.sess.run([self.actor_loss, self.train_actor], feed_dict={
-            self.static_advantages: adv,
+        actor_loss, _ = self.sess.run([self.actor_loss, self.train_actor], feed_dict={
             self.actions: actions,
             self.sequences: seqs,
             self.returns: returns,
             self.on_target_labels: r_ktop,
+            self.q_computed: q_computed
         })
+        #print(f'actor = {al}')
+        #print(f'crititc = {cl}')
 
     def run(self, seqs, rewards):
         return np.squeeze(self.sess.run(self.sample_output_seq, feed_dict={
             self.sequences: np.array([seqs]),
             self.on_target_labels: np.array([rewards]),
         }))
+    
+    def take_max(self, seqs, rewards, actions):
+        '''
+        Argmax Q over actions given prior state (seqs, reward).
+        '''
+        vals = self.sess.run(self.q_pred, feed_dict={
+            self.sequences: [seqs for a in actions],
+            self.on_target_labels: [rewards for a in actions],
+            self.actions: actions,
+        })
+        if random.random() < self.eps:
+            return random.choice(range(len(vals)))
+        else:
+            return np.argmax(vals)
+        
+    def getQ(self, seqs, rewards, action):
+        vals = self.sess.run(self.q_pred, feed_dict={
+            self.sequences: [seqs],
+            self.on_target_labels: [rewards],
+            self.actions: [action],
+        })
+        return vals[0]
     
     def flat(self, state):
         return np.reshape(state, [state.shape[0] * state.shape[1], 4])
@@ -134,17 +160,18 @@ class SeqNet:
             reward_set = []
             for k, sample in enumerate(samples_set):
                 d = lambda x: np.linalg.norm((x[0] - action_set[k]).flatten(), ord=1) // 2
-                idx = min(range(len(sample)), key=lambda x: d(sample[x]))
-                new_seq, reward = sample[idx]
+                idx = list(sorted(range(len(sample)), key=lambda x: d(sample[x])))[:self.knn]
+                proposed_samples = np.array(sample)[idx]
+                act_idx = self.take_max(self.flat(seqs_set[k]), rewards_set[k], [i[0] for i in proposed_samples])
+                new_seq, reward = sample[idx[act_idx]]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                sample[idx] = (new_seq, reward / 2)
+                #sample[idx[act_idx]] = (new_seq, reward / 2)
 
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
             for i, path in enumerate(path_set):
-                path.append((state_set[i], action_set[i], reward_set[i] *\
-                             (1 - d((new_seq_set[i], reward_set[i])) / self.seq_len)))
+                path.append((state_set[i], action_set[i], new_seq_set[i], reward_set[i]))
             for i, _ in enumerate(state_set):
                 state_set[i] = list(sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]) + visited_set[i][-self.kmem:]
         return [zip(*path) for path in path_set]
@@ -158,7 +185,7 @@ class SeqNet:
         return self.multi_path(samples, 1)[0]
 
     
-    def train(self, samples, batch):
+    def train(self, samples, batch, replay):
         '''
         Trains on samples (list of one-hot dna strand, on-target rate tuples) and returns avg reward.
         Generates batch trajectories concurrently.
@@ -168,8 +195,9 @@ class SeqNet:
         labels_set = []
         actions_set = []
         rewards_set = []
+        new_seqs_set = []
         for path in self.multi_path(samples, batch):
-            states, actions, rewards = path
+            states, actions, new_seqs, rewards = path
             for k, i, j in list(zip(states, actions, rewards)):
                 results.append(j)
             seqs = np.array([[v[0] for v in x] for x in states])
@@ -182,32 +210,21 @@ class SeqNet:
                 labels_set.append(label)
             for action in actions:
                 actions_set.append(action)
+            for new_seq in new_seqs:
+                new_seqs_set.append(new_seq)
             returns = [sum((self.gamma ** (i - j)) * rewards[i]
                        for i in range(j, len(rewards)))
                            for j, _ in enumerate(rewards)]
             for reward in returns:
                 rewards_set.append(reward)
-        self.improve(seqs_set, labels_set, actions_set, rewards_set)
+        self.buffer.append((seqs_set, labels_set, actions_set, new_seqs_set, rewards_set))
+        self.buffer = self.buffer[:self.replay]
+        self.itr += 1
+        self.eps = 1 / (1 + (self.itr / self.decay))
+        for data in random.sample(self.buffer, min([replay, len(self.buffer)])):
+            self.improve(*data)
         return np.mean(np.array(results))
     
-    def single_train(self, samples, iterations):
-        '''
-        Like above, but repeatedly trains on single trajectory
-        '''
-        results = []
-        for i in range(iterations):
-            states, actions, rewards = self.path(samples)
-            for k, i, j in list(zip(states, actions, rewards)):
-                results.append(j)
-            seqs = np.array([[v[0] for v in x] for x in states])
-            labels = np.array([[v[1] for v in x] for x in states])
-            returns = [sum((self.gamma ** (i - j)) * rewards[i]
-                       for i in range(j, len(rewards)))
-                           for j, _ in enumerate(rewards)]
-            self.improve(np.reshape(seqs, [seqs.shape[0], 
-                                           seqs.shape[1] * seqs.shape[2], 4]), 
-                                             labels, actions, returns)
-        return np.mean(np.array(results))
             
     def evaluate(self, samples, batch):
         '''
@@ -219,7 +236,7 @@ class SeqNet:
         actions_set = []
         rewards_set = []
         for path in self.multi_path(samples, batch):
-            states, actions, rewards = path
+            states, actions, new_seqs, rewards = path
             for k, i, j in list(zip(states, actions, rewards)):
                 results.append(j)
             seqs = np.array([[v[0] for v in x] for x in states])
