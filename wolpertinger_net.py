@@ -96,6 +96,7 @@ class WolpertingerNet:
             self.on_target_labels: r_ktop,
             self.q_computed: q_computed
         })
+        return actor_loss, critic_loss
         #print(f'actor = {al}')
         #print(f'crititc = {cl}')
 
@@ -166,7 +167,7 @@ class WolpertingerNet:
                 new_seq, reward = sample[idx[act_idx]]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                #sample[idx[act_idx]] = (new_seq, reward / 2)
+                sample[idx[act_idx]] = (new_seq, reward / 2)
 
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
@@ -221,8 +222,13 @@ class WolpertingerNet:
         self.buffer = self.buffer[:self.replay]
         self.itr += 1
         self.eps = 1 / (1 + (self.itr / self.decay))
+        actor_loss = []
+        critic_loss = []
         for data in random.sample(self.buffer, min([replay, len(self.buffer)])):
-            self.improve(*data)
+            a_loss, c_loss = self.improve(*data)
+            actor_loss.append(a_loss)
+            critic_loss.append(c_loss)
+        self.last_loss = (np.array(actor_loss).mean(), np.array(critic_loss).mean())
         return np.mean(np.array(results))
     
             
