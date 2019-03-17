@@ -15,12 +15,12 @@ class WolpertingerNet:
         self.knn = knn
         self.replay = replay
         self.buffer = []
-        self.eps = 1
+        self.eps = tf.Variable(1, dtype=tf.float32)
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
         self.kmem = kmem
-        self.itr = 0
+        self.itr = tf.Variable(0, dtype=tf.float32)
         self.lr = lr
         self.horizon = horizon
         self.build_placeholders()
@@ -79,9 +79,28 @@ class WolpertingerNet:
         self.train_critic = tf.train.AdamOptimizer(self.lr).minimize(self.critic_loss, name='critic_train_op')
 
 
-    def improve(self, seqs, r_ktop, actions, new_seqs, returns):
+    def improve_actor(self, seqs, r_ktop, actions, new_seqs, returns):
         '''
-        Policy gradient update in both actor and critic
+        Policy gradient update in actor
+        '''
+        q_computed = self.sess.run(self.q_pred, feed_dict={
+            self.actions: actions,
+            self.sequences: seqs,
+            self.on_target_labels: r_ktop,
+        })
+        q_computed = np.array(q_computed)
+        q_computed = (q_computed - q_computed.mean()) / q_computed.std()
+        actor_loss, _ = self.sess.run([self.actor_loss, self.train_actor], feed_dict={
+            self.actions: actions,
+            self.sequences: seqs,
+            self.on_target_labels: r_ktop,
+            self.q_computed: q_computed
+        })
+        return actor_loss
+    
+    def improve_critic(self, seqs, r_ktop, actions, new_seqs, returns):
+        '''
+        Refit Q function
         '''
         critic_loss, q_computed, _ = self.sess.run([self.critic_loss, self.q_pred, self.train_critic], feed_dict={
             self.actions: new_seqs,
@@ -89,17 +108,8 @@ class WolpertingerNet:
             self.returns: returns,
             self.on_target_labels: r_ktop,
         })
-        actor_loss, _ = self.sess.run([self.actor_loss, self.train_actor], feed_dict={
-            self.actions: actions,
-            self.sequences: seqs,
-            self.returns: returns,
-            self.on_target_labels: r_ktop,
-            self.q_computed: q_computed
-        })
-        return actor_loss, critic_loss
-        #print(f'actor = {al}')
-        #print(f'crititc = {cl}')
-
+        return critic_loss
+        
     def run(self, seqs, rewards):
         return np.squeeze(self.sess.run(self.sample_output_seq, feed_dict={
             self.sequences: np.array([seqs]),
@@ -115,7 +125,7 @@ class WolpertingerNet:
             self.on_target_labels: [rewards for a in actions],
             self.actions: actions,
         })
-        if random.random() < self.eps:
+        if random.random() < self.sess.run(self.eps):
             return random.choice(range(len(vals)))
         else:
             return np.argmax(vals)
@@ -167,7 +177,7 @@ class WolpertingerNet:
                 new_seq, reward = sample[idx[act_idx]]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                sample[idx[act_idx]] = (new_seq, reward / 2)
+                #sample[idx[act_idx]] = (new_seq, reward / 2)
 
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
@@ -220,14 +230,13 @@ class WolpertingerNet:
                 rewards_set.append(reward)
         self.buffer.append((seqs_set, labels_set, actions_set, new_seqs_set, rewards_set))
         self.buffer = self.buffer[:self.replay]
-        self.itr += 1
-        self.eps = 1 / (1 + (self.itr / self.decay))
-        actor_loss = []
+        self.sess.run(self.itr.assign(self.sess.run(self.itr) + 1))
+        self.sess.run(self.eps.assign(1 / (1 + (self.sess.run(self.itr) / self.decay))))
         critic_loss = []
         for data in random.sample(self.buffer, min([replay, len(self.buffer)])):
-            a_loss, c_loss = self.improve(*data)
-            actor_loss.append(a_loss)
+            c_loss = self.improve_critic(*data)
             critic_loss.append(c_loss)
+        actor_loss = [self.improve_actor(seqs_set, labels_set, actions_set, new_seqs_set, rewards_set)]
         self.last_loss = (np.array(actor_loss).mean(), np.array(critic_loss).mean())
         return np.mean(np.array(results))
     
