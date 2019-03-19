@@ -5,22 +5,26 @@ from tqdm import tqdm, trange
 
 
 class WolpertingerNet:
-    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20, knn=5, eps=0.1, decay=2048, replay=128):
+    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20, knn=5, decay=2048, replay=128, penalty=1, topn=0, reinforce=True):
         '''
         ktop is size of memory buffer, lr is learning rate, and horizon is number of iterations
         per episode. Gamma and seq_len are self explanatory.
         '''
         self.sess = sess
+        self.reinforce = reinforce
+        self.topn = topn
+        self.penalty = penalty
         self.decay = decay
         self.knn = knn
         self.replay = replay
         self.buffer = []
-        self.eps = tf.Variable(1, dtype=tf.float32)
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
         self.kmem = kmem
         self.itr = tf.Variable(0, dtype=tf.float32)
+        self.eps = 1 / (1 + (self.itr / self.decay))
+        self.itr_update_op = tf.assign_add(self.itr, 1)
         self.lr = lr
         self.horizon = horizon
         self.build_placeholders()
@@ -88,8 +92,8 @@ class WolpertingerNet:
             self.sequences: seqs,
             self.on_target_labels: r_ktop,
         })
-        q_computed = np.array(q_computed)
-        q_computed = (q_computed - q_computed.mean()) / q_computed.std()
+        q_computed = np.array(returns) if self.reinforce else np.array(q_computed)
+        q_computed = (q_computed - q_computed.mean()) / (1 + q_computed.std())
         actor_loss, _ = self.sess.run([self.actor_loss, self.train_actor], feed_dict={
             self.actions: actions,
             self.sequences: seqs,
@@ -152,6 +156,9 @@ class WolpertingerNet:
         Same as path but runs multiple concurrently.
         '''
         samples_set = [samples[:] for _ in range(n)]
+        topn_set = []
+        for sample in samples_set:
+            topn_set.append([vec_dna(a) for a, b in sorted(sample, key=lambda x: -x[1])[:self.topn]])
         state_set = [[samples_set[i][random.randrange(len(samples_set[i]))] for _ in range(self.ktop + self.kmem)] for i in range(n)]
         visited_set = [state[:] for state in state_set]
         for i, _ in enumerate(state_set):
@@ -177,12 +184,16 @@ class WolpertingerNet:
                 new_seq, reward = sample[idx[act_idx]]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                #sample[idx[act_idx]] = (new_seq, reward / 2)
+                sample[idx[act_idx]] = (new_seq, reward * self.penalty)
 
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
             for i, path in enumerate(path_set):
-                path.append((state_set[i], action_set[i], new_seq_set[i], reward_set[i]))
+                r = reward_set[i]
+                seq = vec_dna(new_seq_set[i])
+                if self.topn and seq not in topn_set[i]:
+                    r = 0
+                path.append((state_set[i], action_set[i], new_seq_set[i], r))
             for i, _ in enumerate(state_set):
                 state_set[i] = list(sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]) + visited_set[i][-self.kmem:]
         return [zip(*path) for path in path_set]
@@ -230,8 +241,7 @@ class WolpertingerNet:
                 rewards_set.append(reward)
         self.buffer.append((seqs_set, labels_set, actions_set, new_seqs_set, rewards_set))
         self.buffer = self.buffer[:self.replay]
-        self.sess.run(self.itr.assign(self.sess.run(self.itr) + 1))
-        self.sess.run(self.eps.assign(1 / (1 + (self.sess.run(self.itr) / self.decay))))
+        self.sess.run(self.itr_update_op)
         critic_loss = []
         for data in random.sample(self.buffer, min([replay, len(self.buffer)])):
             c_loss = self.improve_critic(*data)

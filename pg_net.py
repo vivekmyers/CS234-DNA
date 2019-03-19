@@ -5,13 +5,14 @@ from tqdm import tqdm, trange
 
 eps = 0.00001
 
-class SeqNet:
-    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20):
+class PGNet:
+    def __init__(self, sess, seq_len=20, ktop=3, kmem=2, lr=0.0001, gamma=0.8, horizon=20, topn=0):
         '''
         ktop is size of memory buffer, lr is learning rate, and horizon is number of iterations
         per episode. Gamma and seq_len are self explanatory.
         '''
         self.sess = sess
+        self.topn = topn
         self.gamma = gamma
         self.seq_len = seq_len
         self.ktop = ktop
@@ -115,6 +116,9 @@ class SeqNet:
         Same as path but runs multiple concurrently.
         '''
         samples_set = [samples[:] for _ in range(n)]
+        topn_set = []
+        for sample in samples_set:
+            topn_set.append([vec_dna(a) for a, b in sorted(sample, key=lambda x: -x[1])[:self.topn]])
         state_set = [[samples_set[i][random.randrange(len(samples_set[i]))] for _ in range(self.ktop + self.kmem)] for i in range(n)]
         visited_set = [state[:] for state in state_set]
         for i, _ in enumerate(state_set):
@@ -138,13 +142,16 @@ class SeqNet:
                 new_seq, reward = sample[idx]
                 new_seq_set.append(new_seq)
                 reward_set.append(reward)
-                sample[idx] = (new_seq, reward / 2)
+                #sample[idx] = (new_seq, reward / 2)
 
             for i, visited in enumerate(visited_set):
                 visited.append((new_seq_set[i], reward_set[i]))
             for i, path in enumerate(path_set):
-                path.append((state_set[i], action_set[i], reward_set[i] *\
-                             (1 - d((new_seq_set[i], reward_set[i])) / self.seq_len)))
+                r = reward_set[i]
+                seq = vec_dna(new_seq_set[i])
+                if self.topn and seq not in topn_set[i]:
+                    r = 0
+                path.append((state_set[i], action_set[i], r))
             for i, _ in enumerate(state_set):
                 state_set[i] = list(sorted(visited_set[i], key=lambda x: -x[1])[:self.ktop]) + visited_set[i][-self.kmem:]
         return [zip(*path) for path in path_set]

@@ -4,10 +4,10 @@ import random
 import sys
 import os
 import pickle
-from wolpertinger_net import *
+from pg_net import *
 
 sess = tf.Session()
-net = WolpertingerNet(sess, seq_len=32, lr=0.0001, topn=3, penalty=1)
+net = PGNet(sess, seq_len=32, lr=0.0001, topn=3)
 
 itr = int(sys.argv[1])
 
@@ -44,7 +44,7 @@ saver.restore(net.sess, 'results/model.ckpt')
 def get_time_top3(dataset):
     test_data = data[random.choice(dataset)]
 
-    s, a, ns, r = net.path([(dna_vec(a), b) for a, b in test_data])
+    s, a, r = net.path([(dna_vec(a), b) for a, b in test_data])
     top3 = sorted(test_data, key=lambda x: x[1])[-3:]
 
     for i, (state, action, reward) in enumerate(zip(s, a, r)):
@@ -61,7 +61,7 @@ for i in trange(itr):
     gene = random.choice(training)
     samples = [(dna_vec(a), b) for a, b in data[gene]]
     #%lprun -f SeqNet.multi_path net.train(samples, 10)
-    tran.append(net.train(samples, 5, 16))
+    tran.append(net.train(samples, 5))
     gene = random.choice(testing)
     samples = [(dna_vec(a), b) for a, b in data[gene]]
     tran_times.append(get_time_top3(training))
